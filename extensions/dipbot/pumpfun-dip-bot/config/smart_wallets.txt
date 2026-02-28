@@ -1,0 +1,7 @@
+# Smart Wallets — one Solana address per line
+# Curate from: GMGN.ai leaderboards, Birdeye top traders, Cielo Finance
+# Update weekly. Remove wallets that stop performing.
+#
+# Example:
+# 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
+# HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH
