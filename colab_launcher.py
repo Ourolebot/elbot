@@ -45,22 +45,12 @@ def ensure_claude_code_cli() -> bool:
 # 0.0.1) Install gh CLI
 # ----------------------------
 def ensure_gh_cli() -> bool:
-    """Best-effort install of GitHub CLI (gh) for GitHub API operations."""
-    if subprocess.run(["bash", "-lc", "command -v gh >/dev/null 2>&1"], check=False).returncode == 0:
+def ensure_gh_cli() -> bool:
+    """Best-effort install of GitHub CLI (gh)."""
+    if subprocess.run(["which", "gh"], capture_output=True).returncode == 0:
         return True
-    subprocess.run([
-        "bash", "-lc",
-        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-        "| dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null "
-        "&& chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg "
-        "&& echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" "
-        "| tee /etc/apt/sources.list.d/github-cli.list > /dev/null "
-        "&& apt-get update -qq "
-        "&& apt-get install -y -qq gh 2>&1 | tail -3",
-    ], check=False)
-    return subprocess.run(["bash", "-lc", "command -v gh >/dev/null 2>&1"], check=False).returncode == 0
-
-# ----------------------------
+    subprocess.run(["apt-get", "install", "-y", "-qq", "gh"], capture_output=True)
+    return subprocess.run(["which", "gh"], capture_output=True).returncode == 0
 # 0.1) provide apply_patch shim
 # ----------------------------
 from ouroboros.apply_patch import install as install_apply_patch
