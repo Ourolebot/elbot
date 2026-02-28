@@ -10,6 +10,9 @@ Cycle:
 6. Repeat
 
 One trade at a time. 2 consecutive stops = done for the day.
+
+Wallet discovery runs as a background task every 30 minutes,
+automatically building the smart_wallets.txt list over time.
 """
 
 import asyncio
@@ -21,7 +24,7 @@ from datetime import datetime, timezone, timedelta
 
 import aiohttp
 
-from .config import cfg
+from .config import cfg, Config
 from .scanner import scan_once, TokenCandidate, SCAN_INTERVAL
 from .analyzer import analyze, Signal
 from .executor import buy_token, sell_token, get_sol_balance, get_token_balance
@@ -72,6 +75,53 @@ def _check_daily_reset():
         daily_loss_reset_date = today
         trades_today = []
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background wallet discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+DISCOVERY_INTERVAL = 1800  # 30 minutes between discovery runs
+DISCOVERY_TOKENS = 20      # how many graduated tokens to scan each run
+
+
+async def _wallet_discovery_loop():
+    """
+    Background task: periodically scan pump.fun for smart wallets.
+    Adds qualifying wallets to config/smart_wallets.txt and hot-reloads cfg.
+    """
+    from .wallet_discovery import WalletDiscovery
+
+    # Stagger first run by 60s so startup completes first
+    await asyncio.sleep(60)
+
+    while running:
+        try:
+            log.info("🔍 Starting wallet discovery run...")
+            discoverer = WalletDiscovery(cfg.helius_api_key, cfg.helius_rpc_url)
+            new_wallets = await discoverer.run_discovery(tokens_to_scan=DISCOVERY_TOKENS)
+            await discoverer.close()
+
+            if new_wallets:
+                # Hot-reload the wallet list
+                total = cfg.reload_wallets()
+                log.info(f"Wallet discovery: +{len(new_wallets)} new (total: {total})")
+                await telegram.send(
+                    f"🔍 <b>Wallet discovery</b>\n"
+                    f"Found {len(new_wallets)} new smart wallets\n"
+                    f"Total tracking: {total}"
+                )
+            else:
+                log.info(f"Wallet discovery: no new wallets (tracking: {len(cfg.smart_wallets)})")
+
+        except Exception as e:
+            log.error(f"Wallet discovery error: {e}", exc_info=True)
+
+        await asyncio.sleep(DISCOVERY_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan + trade logic
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def run_scan_cycle(session: aiohttp.ClientSession) -> Signal | None:
     """Scan and analyze. Returns the first valid signal, or None."""
@@ -132,7 +182,6 @@ async def execute_trade(session: aiohttp.ClientSession, sig: Signal) -> bool:
     token_amount_raw = buy_result.amount_out
 
     if token_amount_raw <= 0 and token_balance > 0:
-        # Estimate raw amount from balance (assume 6 decimals for most SPL tokens)
         token_amount_raw = int(token_balance * 1e6)
 
     # Create position
@@ -143,7 +192,7 @@ async def execute_trade(session: aiohttp.ClientSession, sig: Signal) -> bool:
         entry_price=token.price_usd,
         entry_sol=sol_balance,
         token_amount_raw=token_amount_raw,
-        token_decimals=6,  # most SPL tokens
+        token_decimals=6,
     )
 
     await telegram.notify_entry(
@@ -155,7 +204,6 @@ async def execute_trade(session: aiohttp.ClientSession, sig: Signal) -> bool:
     exit_type, position = await monitor_position(session, position)
 
     # === SELL ===
-    # Re-check actual token balance before selling
     actual_balance_raw = token_amount_raw
     try:
         bal = await get_token_balance(session, token.address)
@@ -174,7 +222,6 @@ async def execute_trade(session: aiohttp.ClientSession, sig: Signal) -> bool:
             f"Token: <code>{token.address}</code>\n"
             f"You need to sell manually!"
         )
-        # Still count as a loss for safety
         consecutive_losses += 1
         return False
 
@@ -215,11 +262,15 @@ async def execute_trade(session: aiohttp.ClientSession, sig: Signal) -> bool:
     return is_win
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def main():
     """Main event loop."""
     global running, consecutive_losses
 
-    # Validate config
+    # Validate config (smart_wallets absence is a warning, not an error)
     errors = cfg.validate()
     if errors:
         for e in errors:
@@ -230,7 +281,7 @@ async def main():
     log.info("=" * 60)
     log.info("DipBot starting")
     log.info(f"  TP: +{cfg.take_profit_pct*100:.0f}%  |  SL: -{cfg.stop_loss_pct*100:.0f}%")
-    log.info(f"  Smart wallets: {len(cfg.smart_wallets)}")
+    log.info(f"  Smart wallets: {len(cfg.smart_wallets)} (auto-discovering more)")
     log.info(f"  Min volume: ${cfg.min_volume_24h:,.0f}")
     log.info(f"  Dip range: {cfg.dip_from_ath_min*100:.0f}%-{cfg.dip_from_ath_max*100:.0f}% from ATH")
     log.info(f"  Min dip age: {cfg.min_dip_age_minutes}min")
@@ -248,47 +299,55 @@ async def main():
 
         await telegram.notify_startup(sol_balance)
 
-        # Main loop
-        while running:
-            _check_daily_reset()
+        # Launch background wallet discovery
+        discovery_task = asyncio.create_task(
+            _wallet_discovery_loop(),
+            name="wallet_discovery",
+        )
+        log.info("Wallet discovery background task started (first run in 60s)")
 
-            # Check daily loss limit
-            if consecutive_losses >= cfg.max_consecutive_losses:
-                log.warning(f"Daily loss limit hit ({consecutive_losses} consecutive losses)")
-                await telegram.notify_daily_stop(consecutive_losses)
+        # Main trading loop
+        try:
+            while running:
+                _check_daily_reset()
 
-                # Sleep until next UTC midnight
-                now = datetime.now(timezone.utc)
-                tomorrow = (now + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                sleep_seconds = (tomorrow - now).total_seconds()
-                log.info(f"Sleeping {sleep_seconds/3600:.1f}h until next UTC day")
-                await asyncio.sleep(min(sleep_seconds, 3600))  # wake hourly to check
-                continue
+                # Check daily loss limit
+                if consecutive_losses >= cfg.max_consecutive_losses:
+                    log.warning(f"Daily loss limit hit ({consecutive_losses} consecutive losses)")
+                    await telegram.notify_daily_stop(consecutive_losses)
 
-            try:
-                # Scan
-                sig = await run_scan_cycle(session)
+                    now = datetime.now(timezone.utc)
+                    tomorrow = (now + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    sleep_seconds = (tomorrow - now).total_seconds()
+                    log.info(f"Sleeping {sleep_seconds/3600:.1f}h until next UTC day")
+                    await asyncio.sleep(min(sleep_seconds, 3600))
+                    continue
 
-                if sig and sig.is_valid:
-                    # Execute trade
-                    await execute_trade(session, sig)
+                try:
+                    sig = await run_scan_cycle(session)
 
-                    # Brief cooldown between trades
-                    log.info("Trade complete. Cooling down 30s before next scan...")
+                    if sig and sig.is_valid:
+                        await execute_trade(session, sig)
+                        log.info("Trade complete. Cooling down 30s before next scan...")
+                        await asyncio.sleep(30)
+                    else:
+                        log.info(f"No signal. Next scan in {SCAN_INTERVAL}s...")
+                        await asyncio.sleep(SCAN_INTERVAL)
+
+                except Exception as e:
+                    log.error(f"Unexpected error in main loop: {e}", exc_info=True)
+                    await telegram.send(f"⚠️ Error in main loop: {e}")
                     await asyncio.sleep(30)
-                else:
-                    # No signal — wait and scan again
-                    log.info(f"No signal. Next scan in {SCAN_INTERVAL}s...")
-                    await asyncio.sleep(SCAN_INTERVAL)
 
-            except Exception as e:
-                log.error(f"Unexpected error in main loop: {e}", exc_info=True)
-                await telegram.send(f"⚠️ Error in main loop: {e}")
-                await asyncio.sleep(30)  # don't spam on repeated errors
+        finally:
+            discovery_task.cancel()
+            try:
+                await discovery_task
+            except asyncio.CancelledError:
+                pass
 
-    # Shutdown
     log.info("Bot stopped")
     await telegram.notify_shutdown("Graceful shutdown")
 
