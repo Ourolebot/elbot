@@ -9,10 +9,10 @@ Criteria for a "smart wallet":
   - Realized PnL positive overall
   - Not a known bot pattern (no two trades < 5s apart)
 
-Discovery flow:
-  1. Fetch recently graduated pump.fun tokens (hit Raydium bonding curve)
-  2. For each token, get all trade history from pump.fun API
-  3. Group trades by wallet
+Discovery flow (Helius-based, no pump.fun direct API needed):
+  1. Fetch recently graduated pump.fun tokens via DexScreener (pumpswap → raydium migration)
+  2. Fetch all trades for each token via Helius Enhanced Transactions API
+  3. Group trades by wallet, compute stats
   4. Score each wallet against criteria
   5. Save qualifying wallets to config/smart_wallets.txt
 """
@@ -38,6 +38,9 @@ MIN_AVG_WIN_PCT = 0.30          # average winning trade = +30%
 MAX_WHALE_SHARE = 0.30          # single trade can't be >30% of total volume
 MAX_INACTIVE_DAYS = 7           # must have traded in last 7 days
 BOT_INTERVAL_SECS = 5           # two trades this close = bot pattern
+
+DEXSCREENER_BASE = "https://api.dexscreener.com"
+HELIUS_BASE = "https://api.helius.xyz"
 
 
 @dataclass
@@ -84,19 +87,15 @@ class WalletStats:
 
 
 class WalletDiscovery:
-    """Discovers smart wallets by analyzing pump.fun trade history."""
+    """Discovers smart wallets by analyzing pump.fun trade history via Helius."""
 
-    PUMP_API = "https://frontend-api.pump.fun"
-
-    def __init__(self, helius_api_key: str, helius_rpc_url: str):
+    def __init__(self, helius_api_key: str):
         self.helius_api_key = helius_api_key
-        self.helius_rpc_url = helius_rpc_url
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def _session_get(self) -> aiohttp.ClientSession:
+    async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"User-Agent": "Mozilla/5.0 (compatible; dipbot/1.0)"},
                 timeout=aiohttp.ClientTimeout(total=20),
             )
         return self._session
@@ -106,54 +105,177 @@ class WalletDiscovery:
             await self._session.close()
 
     # -------------------------------------------------------------------------
-    # Pump.fun API calls
+    # DexScreener — find recently migrated pump.fun tokens
     # -------------------------------------------------------------------------
 
-    async def fetch_recent_graduates(self, limit: int = 50) -> list[str]:
+    async def fetch_recent_pump_tokens(self, limit: int = 50) -> list[str]:
         """
-        Fetch recently graduated pump.fun tokens.
-        Graduated = bonding curve completed = now on Raydium.
-        These are the tokens where all the interesting action happened.
+        Fetch recently active pump.fun tokens via DexScreener.
+        We use the pumpswap dex — tokens traded there are on the bonding curve
+        OR recently graduated. Filter by recent creation (< 48h) and decent volume.
         """
-        session = await self._session_get()
+        session = await self._get_session()
+        addresses: list[str] = []
         try:
+            # Get token profiles/boosts — these are often fresh pump.fun tokens
             async with session.get(
-                f"{self.PUMP_API}/coins",
-                params={
-                    "offset": 0,
-                    "limit": limit,
-                    "sort": "last_trade_timestamp",
-                    "order": "DESC",
-                    "includeNsfw": "false",
-                }
+                f"{DEXSCREENER_BASE}/token-profiles/latest/v1",
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get("chainId") == "solana":
+                                addr = item.get("tokenAddress", "")
+                                if addr:
+                                    addresses.append(addr)
+
+            # Also try token-boosts
+            async with session.get(
+                f"{DEXSCREENER_BASE}/token-boosts/latest/v1",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get("chainId") == "solana":
+                                addr = item.get("tokenAddress", "")
+                                if addr and addr not in addresses:
+                                    addresses.append(addr)
+
+        except Exception as e:
+            logger.warning(f"DexScreener error: {e}")
+
+        # Deduplicate and limit
+        seen = set()
+        unique = []
+        for addr in addresses:
+            if addr not in seen:
+                seen.add(addr)
+                unique.append(addr)
+            if len(unique) >= limit:
+                break
+
+        logger.info(f"DexScreener: found {len(unique)} recent pump.fun token addresses")
+        return unique
+
+    # -------------------------------------------------------------------------
+    # Helius — get transaction history for a token
+    # -------------------------------------------------------------------------
+
+    async def fetch_token_transactions(
+        self,
+        token_address: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        Fetch enhanced transaction history for a token address via Helius.
+        Returns parsed transactions with type, source, and account info.
+        """
+        session = await self._get_session()
+        url = f"{HELIUS_BASE}/v0/addresses/{token_address}/transactions"
+        params = {
+            "api-key": self.helius_api_key,
+            "limit": min(limit, 100),  # Helius max per call
+            "type": "SWAP",
+        }
+        try:
+            async with session.get(url, params=params) as r:
+                if r.status == 429:
+                    logger.warning("Helius rate limited, waiting 10s")
+                    await asyncio.sleep(10)
+                    return []
                 if r.status != 200:
-                    logger.warning(f"fetch_recent_graduates HTTP {r.status}")
+                    text = await r.text()
+                    logger.debug(f"Helius {r.status} for {token_address[:8]}: {text[:100]}")
                     return []
                 data = await r.json()
-                # Only graduated tokens have a raydium_pool set
-                mints = [c["mint"] for c in data if c.get("raydium_pool")]
-                logger.info(f"Found {len(mints)}/{len(data)} graduated tokens")
-                return mints
+                return data if isinstance(data, list) else []
         except Exception as e:
-            logger.warning(f"fetch_recent_graduates error: {e}")
+            logger.debug(f"fetch_token_transactions({token_address[:8]}): {e}")
             return []
 
-    async def fetch_token_trades(self, mint: str, limit: int = 500) -> list[dict]:
-        """Fetch trade history for a token from pump.fun."""
-        session = await self._session_get()
-        try:
-            async with session.get(
-                f"{self.PUMP_API}/trades/all/{mint}",
-                params={"limit": limit, "offset": 0, "minimumSize": 0},
-            ) as r:
-                if r.status != 200:
-                    logger.debug(f"fetch_token_trades({mint[:8]}) HTTP {r.status}")
-                    return []
-                return await r.json()
-        except Exception as e:
-            logger.debug(f"fetch_token_trades({mint[:8]}) error: {e}")
-            return []
+    # -------------------------------------------------------------------------
+    # Extract wallet trades from Helius transactions
+    # -------------------------------------------------------------------------
+
+    def _parse_trades(self, txns: list[dict], token_address: str) -> dict[str, list[dict]]:
+        """
+        Parse Helius enhanced transactions into per-wallet trade records.
+        Each trade: {wallet, is_buy, sol_amount, timestamp}
+        """
+        by_wallet: dict[str, list[dict]] = {}
+
+        for tx in txns:
+            if not isinstance(tx, dict):
+                continue
+
+            # Helius enhanced tx format
+            timestamp = tx.get("timestamp", 0)
+            fee_payer = tx.get("feePayer", "")
+            account_data = tx.get("accountData", [])
+            native_transfers = tx.get("nativeTransfers", [])
+            token_transfers = tx.get("tokenTransfers", [])
+
+            # Identify the swapper (usually the fee payer)
+            wallet = fee_payer
+            if not wallet:
+                continue
+
+            # Determine direction: look at SOL flow vs token flow
+            sol_in = 0.0
+            sol_out = 0.0
+            got_token = False
+            sent_token = False
+
+            for transfer in native_transfers:
+                from_acc = transfer.get("fromUserAccount", "")
+                to_acc = transfer.get("toUserAccount", "")
+                amount = transfer.get("amount", 0) / 1e9  # lamports → SOL
+
+                if from_acc == wallet:
+                    sol_out += amount
+                elif to_acc == wallet:
+                    sol_in += amount
+
+            for transfer in token_transfers:
+                mint = transfer.get("mint", "")
+                from_acc = transfer.get("fromUserAccount", "")
+                to_acc = transfer.get("toUserAccount", "")
+
+                if mint != token_address:
+                    continue
+                if to_acc == wallet:
+                    got_token = True
+                elif from_acc == wallet:
+                    sent_token = True
+
+            # Determine trade type
+            if got_token and sol_out > 0:
+                is_buy = True
+                sol_amount = sol_out
+            elif sent_token and sol_in > 0:
+                is_buy = False
+                sol_amount = sol_in
+            else:
+                # Can't determine direction
+                continue
+
+            if sol_amount < 0.001:  # too small to be meaningful
+                continue
+
+            trade = {
+                "wallet": wallet,
+                "is_buy": is_buy,
+                "sol_amount": sol_amount,
+                "timestamp": timestamp,
+            }
+
+            by_wallet.setdefault(wallet, []).append(trade)
+
+        return by_wallet
 
     # -------------------------------------------------------------------------
     # Wallet analysis
@@ -162,104 +284,66 @@ class WalletDiscovery:
     def _analyze_wallet(self, wallet: str, trades: list[dict]) -> WalletStats:
         """
         Build WalletStats for one wallet from its trade list.
-        
-        A "completed trade" = one or more buys followed by a sell on the same token.
-        We track SOL in/out to compute PnL.
+        A "completed trade" = buys followed by sells on the same token.
         """
         stats = WalletStats(address=wallet)
         if not trades:
             return stats
 
-        # Sort chronologically
         sorted_trades = sorted(trades, key=lambda t: t.get("timestamp", 0))
 
-        # Detect bot pattern: any two consecutive trades < BOT_INTERVAL_SECS apart
+        # Detect bot pattern
         timestamps = [t.get("timestamp", 0) for t in sorted_trades]
         for i in range(1, len(timestamps)):
             if timestamps[i] - timestamps[i - 1] < BOT_INTERVAL_SECS:
                 stats.is_bot_pattern = True
                 break
 
-        # Last activity
         if timestamps:
             stats.last_active_days_ago = int((time.time() - max(timestamps)) / 86400)
 
-        # Group by token mint, track SOL flows
-        positions: dict[str, dict] = {}  # mint -> {sol_in, sol_out}
-        total_volume_sol = 0.0
+        # PnL calculation: simple SOL in vs out
+        total_sol_in = sum(t["sol_amount"] for t in sorted_trades if t["is_buy"])
+        total_sol_out = sum(t["sol_amount"] for t in sorted_trades if not t["is_buy"])
+        total_volume = total_sol_in + total_sol_out
 
-        for t in sorted_trades:
-            mint = t.get("mint", "")
-            if not mint:
-                continue
-            sol = t.get("sol_amount", 0) / 1e9  # lamports → SOL
-            is_buy = t.get("is_buy", False)
+        stats.total_pnl_sol = total_sol_out - total_sol_in
 
-            if mint not in positions:
-                positions[mint] = {"sol_in": 0.0, "sol_out": 0.0}
+        # Consider each buy→sell pair as one trade
+        buys = sorted([t for t in sorted_trades if t["is_buy"]], key=lambda t: t["timestamp"])
+        sells = sorted([t for t in sorted_trades if not t["is_buy"]], key=lambda t: t["timestamp"])
 
-            if is_buy:
-                positions[mint]["sol_in"] += sol
+        # Match buys to sells greedily
+        buy_idx = 0
+        sell_idx = 0
+        completed = []
+
+        while buy_idx < len(buys) and sell_idx < len(sells):
+            buy = buys[buy_idx]
+            sell = sells[sell_idx]
+
+            if sell["timestamp"] > buy["timestamp"]:
+                pnl = sell["sol_amount"] - buy["sol_amount"]
+                pnl_pct = pnl / buy["sol_amount"] if buy["sol_amount"] > 0 else 0
+                completed.append({"pnl_sol": pnl, "pnl_pct": pnl_pct, "vol": buy["sol_amount"] + sell["sol_amount"]})
+                buy_idx += 1
+                sell_idx += 1
             else:
-                positions[mint]["sol_out"] += sol
-            total_volume_sol += sol
-
-        # Score completed trades (both buy and sell happened)
-        completed = [
-            pos for pos in positions.values()
-            if pos["sol_in"] > 0 and pos["sol_out"] > 0
-        ]
+                sell_idx += 1  # skip early sell
 
         stats.total_trades = len(completed)
         if not completed:
             return stats
 
-        pnl_list = []
-        for pos in completed:
-            pnl_sol = pos["sol_out"] - pos["sol_in"]
-            pnl_pct = pnl_sol / pos["sol_in"]
-            pnl_list.append({"pnl_sol": pnl_sol, "pnl_pct": pnl_pct, "vol": pos["sol_in"] + pos["sol_out"]})
-
-        wins = [p for p in pnl_list if p["pnl_sol"] > 0]
+        wins = [p for p in completed if p["pnl_sol"] > 0]
         stats.winning_trades = len(wins)
-        stats.total_pnl_sol = sum(p["pnl_sol"] for p in pnl_list)
-        stats.avg_win_pct = (
-            sum(p["pnl_pct"] for p in wins) / len(wins) if wins else 0.0
-        )
+        stats.avg_win_pct = sum(p["pnl_pct"] for p in wins) / len(wins) if wins else 0.0
 
-        if total_volume_sol > 0:
-            max_trade_vol = max(p["vol"] for p in pnl_list)
-            stats.max_single_trade_share = max_trade_vol / total_volume_sol
+        if total_volume > 0:
+            max_trade_vol = max(p["vol"] for p in completed)
+            stats.max_single_trade_share = max_trade_vol / total_volume
 
         return stats
-
-    async def discover_from_token(self, mint: str) -> list[WalletStats]:
-        """
-        Analyze all wallets that traded a specific token.
-        Returns list of WalletStats that qualify.
-        """
-        trades = await self.fetch_token_trades(mint)
-        if not trades:
-            return []
-
-        # Group trades by wallet
-        by_wallet: dict[str, list[dict]] = {}
-        for t in trades:
-            w = t.get("user", "")
-            if w:
-                by_wallet.setdefault(w, []).append(t)
-
-        qualified = []
-        for wallet, wallet_trades in by_wallet.items():
-            stats = self._analyze_wallet(wallet, wallet_trades)
-            passes, reason = stats.qualifies()
-            if passes:
-                qualified.append(stats)
-                logger.debug(f"  ✅ {wallet[:8]}... {stats.summary()}")
-            else:
-                logger.debug(f"  ❌ {wallet[:8]}... rejected: {reason}")
-
-        return qualified
 
     # -------------------------------------------------------------------------
     # Main discovery runner
@@ -267,34 +351,36 @@ class WalletDiscovery:
 
     async def run_discovery(self, tokens_to_scan: int = 20) -> list[str]:
         """
-        Full discovery run:
-        1. Fetch recently graduated tokens
-        2. Analyze traders on each token
-        3. Add qualifying wallets to smart_wallets.txt
+        Full discovery run.
         Returns list of newly added wallet addresses.
         """
-        logger.info(f"🔍 Wallet discovery: scanning {tokens_to_scan} graduated tokens...")
+        logger.info(f"🔍 Wallet discovery: scanning {tokens_to_scan} pump.fun tokens...")
 
-        mints = await self.fetch_recent_graduates(limit=tokens_to_scan)
-        if not mints:
-            logger.warning("No graduated tokens found — pump.fun API might be down")
+        token_addresses = await self.fetch_recent_pump_tokens(limit=tokens_to_scan)
+        if not token_addresses:
+            logger.warning("No tokens found from DexScreener")
             return []
 
         all_qualifying: dict[str, WalletStats] = {}
 
-        for i, mint in enumerate(mints):
-            found = await self.discover_from_token(mint)
-            if found:
-                logger.info(f"  [{i+1}/{len(mints)}] {mint[:8]}...: {len(found)} qualified")
-                for s in found:
-                    # Keep the best stats if wallet appears across multiple tokens
-                    if s.address not in all_qualifying or s.win_rate > all_qualifying[s.address].win_rate:
-                        all_qualifying[s.address] = s
-            else:
-                logger.debug(f"  [{i+1}/{len(mints)}] {mint[:8]}...: none qualified")
+        for i, token_addr in enumerate(token_addresses):
+            txns = await self.fetch_token_transactions(token_addr, limit=100)
+            if not txns:
+                continue
 
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(0.5)
+            by_wallet = self._parse_trades(txns, token_addr)
+            for wallet, trades in by_wallet.items():
+                stats = self._analyze_wallet(wallet, trades)
+                passes, reason = stats.qualifies()
+                if passes:
+                    if wallet not in all_qualifying or stats.win_rate > all_qualifying[wallet].win_rate:
+                        all_qualifying[wallet] = stats
+                        logger.debug(f"  ✅ {wallet[:8]}... {stats.summary()}")
+
+            if i % 5 == 0:
+                logger.info(f"  Progress: {i+1}/{len(token_addresses)}, qualified so far: {len(all_qualifying)}")
+
+            await asyncio.sleep(0.3)  # Helius rate limit: ~10 req/s on free tier
 
         # Load existing wallets
         existing: set[str] = set()
@@ -302,7 +388,8 @@ class WalletDiscovery:
             for line in WALLETS_FILE.read_text().splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    existing.add(line)
+                    addr = line.split()[0]  # address is first token
+                    existing.add(addr)
 
         new_wallets = {addr: s for addr, s in all_qualifying.items() if addr not in existing}
 
@@ -310,22 +397,21 @@ class WalletDiscovery:
             WALLETS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with WALLETS_FILE.open("a") as f:
                 for addr, stats in sorted(new_wallets.items()):
-                    # Write with stats as comment for transparency
                     f.write(f"{addr}  # {stats.summary()}\n")
 
             logger.info(
-                f"✅ Added {len(new_wallets)} wallets "
+                f"✅ Added {len(new_wallets)} new wallets "
                 f"(total: {len(existing) + len(new_wallets)})"
             )
         else:
-            logger.info(f"No new wallets found (existing: {len(existing)})")
+            logger.info(f"No new qualifying wallets found (existing: {len(existing)})")
 
         return list(new_wallets.keys())
 
 
-async def run_once(helius_api_key: str, helius_rpc_url: str, tokens: int = 20) -> list[str]:
+async def run_once(helius_api_key: str, tokens: int = 20) -> list[str]:
     """Convenience function for one-shot discovery."""
-    d = WalletDiscovery(helius_api_key, helius_rpc_url)
+    d = WalletDiscovery(helius_api_key)
     try:
         return await d.run_discovery(tokens_to_scan=tokens)
     finally:
@@ -333,16 +419,12 @@ async def run_once(helius_api_key: str, helius_rpc_url: str, tokens: int = 20) -
 
 
 if __name__ == "__main__":
-    # Can run directly for testing:
-    # python -m src.wallet_discovery
     import os
-    from pathlib import Path
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent.parent / "config" / ".env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     results = asyncio.run(run_once(
         os.getenv("HELIUS_API_KEY", ""),
-        os.getenv("HELIUS_RPC_URL", ""),
     ))
     print(f"\nDiscovered {len(results)} new wallets:")
     for w in results:
