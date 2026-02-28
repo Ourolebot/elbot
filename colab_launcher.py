@@ -40,7 +40,16 @@ def ensure_claude_code_cli() -> bool:
     has_cli = subprocess.run(["bash", "-lc", "command -v claude >/dev/null 2>&1"], check=False).returncode == 0
     return has_cli
 
+
 # ----------------------------
+# 0.0.1) Install gh CLI
+# ----------------------------
+def ensure_gh_cli() -> bool:
+    """Best-effort install of GitHub CLI (gh)."""
+    if subprocess.run(["which", "gh"], capture_output=True).returncode == 0:
+        return True
+    subprocess.run(["apt-get", "install", "-y", "-qq", "gh"], capture_output=True)
+    return subprocess.run(["which", "gh"], capture_output=True).returncode == 0
 # 0.1) provide apply_patch shim
 # ----------------------------
 from ouroboros.apply_patch import install as install_apply_patch
@@ -50,14 +59,14 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+#from google.colab import userdata  # type: ignore
+#from google.colab import drive  # type: ignore
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
     try:
-        return userdata.get(name)
+        return None  # VPS: no Colab
     except Exception:
         return None
 
@@ -148,15 +157,17 @@ os.environ["TELEGRAM_BOT_TOKEN"] = str(TELEGRAM_BOT_TOKEN)
 
 if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
+os.environ["GH_TOKEN"] = str(GITHUB_TOKEN)  # gh CLI auth
+ensure_gh_cli()
 
 # ----------------------------
 # 2) Mount Drive
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
+if False:  # VPS
+    pass  #drive.mount("/content/drive")
 
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+DRIVE_ROOT = pathlib.Path("/root/elbot/data").resolve()
+REPO_DIR = pathlib.Path("/root/elbot").resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,16 @@
+[Unit]
+Description=PumpFun Dip Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/pumpfun-dip-bot
+ExecStart=/root/pumpfun-dip-bot/venv/bin/python -m src.main
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
