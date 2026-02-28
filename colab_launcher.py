@@ -59,14 +59,14 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+#from google.colab import userdata  # type: ignore
+#from google.colab import drive  # type: ignore
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
     try:
-        return userdata.get(name)
+        return None  # VPS: no Colab
     except Exception:
         return None
 
@@ -163,11 +163,11 @@ ensure_gh_cli()
 # ----------------------------
 # 2) Mount Drive
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
+if False:  # VPS
+    pass  #drive.mount("/content/drive")
 
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+DRIVE_ROOT = pathlib.Path("/root/elbot/data").resolve()
+REPO_DIR = pathlib.Path("/root/elbot").resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)
