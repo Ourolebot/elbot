@@ -2,17 +2,18 @@
 Main loop — the brain of the dip bot.
 
 Cycle:
-1. Scan for pump.fun migration dip candidates
+1. Scan for pump.fun migration dip candidates (via DexScreener)
 2. Analyze top candidates for entry signals
-3. If signal fires, execute buy (100% portfolio)
+3. If signal fires, execute buy (full portfolio)
 4. Monitor position until TP/SL
 5. Log result, check daily loss limit
 6. Repeat
 
-One trade at a time. 2 consecutive stops = done for the day.
+One trade at a time. Max consecutive stops = done for the day.
 
 Wallet discovery runs as a background task every 30 minutes,
-automatically building the smart_wallets.txt list over time.
+automatically building the smart_wallets.txt list over time using
+Helius transaction data (no pump.fun API dependency).
 """
 
 import asyncio
@@ -81,12 +82,12 @@ def _check_daily_reset():
 # ─────────────────────────────────────────────────────────────────────────────
 
 DISCOVERY_INTERVAL = 1800  # 30 minutes between discovery runs
-DISCOVERY_TOKENS = 20      # how many graduated tokens to scan each run
+DISCOVERY_TOKENS = 20      # how many tokens to scan each run
 
 
 async def _wallet_discovery_loop():
     """
-    Background task: periodically scan pump.fun for smart wallets.
+    Background task: periodically scan pump.fun ecosystem for smart wallets.
     Adds qualifying wallets to config/smart_wallets.txt and hot-reloads cfg.
     """
     from .wallet_discovery import WalletDiscovery
@@ -97,12 +98,12 @@ async def _wallet_discovery_loop():
     while running:
         try:
             log.info("🔍 Starting wallet discovery run...")
-            discoverer = WalletDiscovery(cfg.helius_api_key, cfg.helius_rpc_url)
+            discoverer = WalletDiscovery(cfg.helius_api_key)
             new_wallets = await discoverer.run_discovery(tokens_to_scan=DISCOVERY_TOKENS)
             await discoverer.close()
 
             if new_wallets:
-                # Hot-reload the wallet list
+                # Hot-reload the wallet list into config
                 total = cfg.reload_wallets()
                 log.info(f"Wallet discovery: +{len(new_wallets)} new (total: {total})")
                 await telegram.send(
@@ -133,7 +134,7 @@ async def run_scan_cycle(session: aiohttp.ClientSession) -> Signal | None:
 
     log.info(f"Evaluating {len(candidates)} candidates...")
 
-    # Analyze top 5 by volume (don't burn API credits on all of them)
+    # Analyze top 5 by volume
     for candidate in candidates[:5]:
         sig = await analyze(session, candidate)
 
@@ -285,11 +286,10 @@ async def main():
     log.info(f"  Min volume: ${cfg.min_volume_24h:,.0f}")
     log.info(f"  Dip range: {cfg.dip_from_ath_min*100:.0f}%-{cfg.dip_from_ath_max*100:.0f}% from ATH")
     log.info(f"  Min dip age: {cfg.min_dip_age_minutes}min")
-    log.info(f"  Max daily losses: {cfg.max_consecutive_losses}")
+    log.info(f"  Max consecutive losses: {cfg.max_consecutive_losses}")
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
-        # Startup checks
         sol_balance = await get_sol_balance(session)
         log.info(f"Wallet balance: {sol_balance:.4f} SOL")
 
