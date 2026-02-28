@@ -40,6 +40,26 @@ def ensure_claude_code_cli() -> bool:
     has_cli = subprocess.run(["bash", "-lc", "command -v claude >/dev/null 2>&1"], check=False).returncode == 0
     return has_cli
 
+
+# ----------------------------
+# 0.0.1) Install gh CLI
+# ----------------------------
+def ensure_gh_cli() -> bool:
+    """Best-effort install of GitHub CLI (gh) for GitHub API operations."""
+    if subprocess.run(["bash", "-lc", "command -v gh >/dev/null 2>&1"], check=False).returncode == 0:
+        return True
+    subprocess.run([
+        "bash", "-lc",
+        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
+        "| dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null "
+        "&& chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg "
+        "&& echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" "
+        "| tee /etc/apt/sources.list.d/github-cli.list > /dev/null "
+        "&& apt-get update -qq "
+        "&& apt-get install -y -qq gh 2>&1 | tail -3",
+    ], check=False)
+    return subprocess.run(["bash", "-lc", "command -v gh >/dev/null 2>&1"], check=False).returncode == 0
+
 # ----------------------------
 # 0.1) provide apply_patch shim
 # ----------------------------
@@ -148,6 +168,8 @@ os.environ["TELEGRAM_BOT_TOKEN"] = str(TELEGRAM_BOT_TOKEN)
 
 if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
+os.environ["GH_TOKEN"] = str(GITHUB_TOKEN)  # gh CLI auth
+ensure_gh_cli()
 
 # ----------------------------
 # 2) Mount Drive
