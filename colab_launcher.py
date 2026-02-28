@@ -45,7 +45,6 @@ def ensure_claude_code_cli() -> bool:
 # 0.0.1) Install gh CLI
 # ----------------------------
 def ensure_gh_cli() -> bool:
-def ensure_gh_cli() -> bool:
     """Best-effort install of GitHub CLI (gh)."""
     if subprocess.run(["which", "gh"], capture_output=True).returncode == 0:
         return True
